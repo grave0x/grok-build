@@ -956,3 +956,113 @@ fn rotation_selects_the_trusted_key_by_signed_key_id() {
         Err(SigError::SignatureMismatch)
     );
 }
+
+/// Full integration: sign → persist → verify → tamper → detect → restore → verify.
+///
+/// Exercises the complete managed-policy integrity cycle through the key-injected
+/// public entry points (`write_sidecar`, `signed_cache_compromised_with_keys`,
+/// `cloud_cache_signature_invalid_with_keys`, `check_on_disk_matches`).
+/// This is the scenario that becomes active once a deployer populates
+/// `EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS`.
+#[test]
+fn full_integration_sign_persist_verify_tamper_detect() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (kp, pubkey) = test_keypair();
+    let trusted = keyset("v1", &pubkey);
+
+    let p = SignedPayload {
+        fail_closed: true,
+        ..payload()
+    };
+
+    // No policy or sidecar yet → nothing to verify.
+    assert!(!cloud_cache_signature_invalid_with_keys(home, &trusted, Some("team-007"), 1_000));
+
+    // Write matching policy files.
+    write_policy(home, &p);
+
+    // Policy present, no sidecar yet → invalid (would trigger a refetch).
+    assert!(cloud_cache_signature_invalid_with_keys(home, &trusted, Some("team-007"), 1_000));
+    assert_eq!(
+        signed_cache_compromised_with_keys(home, &trusted, Some("team-007"), 1_000),
+        SignedVerdict::NoAuthenticSidecar
+    );
+
+    // Persist a signed sidecar via the public API.
+    write_sidecar(home, &sign(&kp, &p)).unwrap();
+
+    // Now the cache is fully covered → valid.
+    assert!(!cloud_cache_signature_invalid_with_keys(home, &trusted, Some("team-007"), 1_000));
+    assert_eq!(
+        signed_cache_compromised_with_keys(home, &trusted, Some("team-007"), 1_000),
+        SignedVerdict::Trusted
+    );
+
+    // Tamper with the on-disk policy.
+    std::fs::write(
+        home.join("requirements.toml"),
+        "[features]\nweb_fetch = true\n",
+    )
+    .unwrap();
+
+    // Tamper detected at both the refetch trigger and the gate.
+    assert!(cloud_cache_signature_invalid_with_keys(home, &trusted, Some("team-007"), 1_000));
+    assert_eq!(
+        signed_cache_compromised_with_keys(home, &trusted, Some("team-007"), 1_000),
+        SignedVerdict::Compromised
+    );
+    // The individual content check confirms exactly what was tampered.
+    assert_eq!(
+        check_on_disk_matches(home, &p),
+        Err(SigError::ContentMismatch("requirements"))
+    );
+
+    // Restore the policy to match the signed content.
+    write_policy(home, &p);
+
+    // Fully recovered.
+    assert!(!cloud_cache_signature_invalid_with_keys(home, &trusted, Some("team-007"), 1_000));
+    assert_eq!(
+        signed_cache_compromised_with_keys(home, &trusted, Some("team-007"), 1_000),
+        SignedVerdict::Trusted
+    );
+    assert!(check_on_disk_matches(home, &p).is_ok());
+}
+
+/// First keyed deployment: a managed policy exists on disk (from a previous
+/// unverified fetch) but no sidecar yet — the cache reads inauthentic and
+/// triggers a refetch, but the gate does NOT refuse (it's not a local tamper,
+/// just the first keyed launch).
+#[test]
+fn first_keyed_deployment_no_sidecar_is_not_compromised() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (kp, pubkey) = test_keypair();
+    let trusted = keyset("v1", &pubkey);
+
+    let p = SignedPayload {
+        fail_closed: true,
+        ..payload()
+    };
+    write_policy(home, &p);
+
+    // Policy on disk, no sidecar → NoAuthenticSidecar (never Compromised
+    // from unverified bytes), and the refetch trigger fires.
+    assert_eq!(
+        signed_cache_compromised_with_keys(home, &trusted, Some("team-007"), 1_000),
+        SignedVerdict::NoAuthenticSidecar,
+        "first keyed launch with policy but no sidecar must not read Compromised"
+    );
+    assert!(
+        cloud_cache_signature_invalid_with_keys(home, &trusted, Some("team-007"), 1_000),
+        "the missing sidecar must trigger a refetch"
+    );
+
+    // After one successful fetch + persist, the cache is clean.
+    write_sidecar(home, &sign(&kp, &p)).unwrap();
+    assert_eq!(
+        signed_cache_compromised_with_keys(home, &trusted, Some("team-007"), 1_000),
+        SignedVerdict::Trusted
+    );
+}

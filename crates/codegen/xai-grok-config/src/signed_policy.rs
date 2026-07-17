@@ -12,6 +12,14 @@ pub use prod_mc_cli_chat_proxy_types::{SignatureEnvelope, SignedPayload, now_uni
 /// Compiled-in trusted Ed25519 public keys, `(key_id, raw 32 bytes)`; more than one
 /// entry only during a rotation. Empty ships dark (see [`verification_active`]).
 /// Compile-time, not an env flag: the local attacker controls their env.
+///
+/// **Important:** In this open-source build the array is empty, so the entire
+/// signed managed-policy verification pathway is **inactive**. Policy signing,
+/// tamper detection, and fail-closed enforcement are inert until a deployer
+/// injects public keys at compile time. This is by design: the secret signing
+/// keys are not shipped. Enterprise deployments MUST rebuild with
+/// `EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS` populated to enable integrity
+/// protection for managed configuration.
 pub const EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS: &[(&str, &[u8])] = &[];
 const _: () = {
     let keys = EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS;
@@ -385,6 +393,19 @@ pub fn signed_cache_compromised(
     now_unix: u64,
 ) -> SignedVerdict {
     if !verification_active() {
+        let has_policy =
+            home.join("requirements.toml").exists() || home.join("managed_config.toml").exists();
+        if has_policy {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "Managed policy files present but signature verification is inactive \
+                     (no EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS in this build). Tamper detection, \
+                     identity binding, and fail-closed enforcement are not active. Rebuild with \
+                     keys populated for production managed-config integrity."
+                );
+            });
+        }
         return SignedVerdict::Inactive;
     }
     with_embedded_keys(|keys| {
