@@ -68,6 +68,16 @@ pub enum ProfileName {
     Custom(String),
 }
 
+/// All names that are currently recognized as built-in profile variants.
+/// Used at config-merge time to warn when a project profile shadows a name
+/// that the parser will treat as a built-in rather than a custom variant.
+///
+/// When adding a new variant to [`ProfileName`], add its string representation
+/// here so the merge guard stays in sync.
+pub fn built_in_profile_names() -> &'static [&'static str] {
+    &["workspace", "devbox", "read-only", "readonly", "strict", "off", "none"]
+}
+
 impl ProfileName {
     pub fn restricts_network(&self) -> bool {
         matches!(self, Self::ReadOnly | Self::Strict)
@@ -168,6 +178,14 @@ fn mismatched_profile_names(global: &SandboxConfig, project: &SandboxConfig) -> 
 /// ignored so a workspace cannot replace a global custom profile's policy.
 fn merge_project_profiles(config: &mut SandboxConfig, project: SandboxConfig) {
     for (name, profile) in project.profiles {
+        if built_in_profile_names().contains(&name.as_str()) {
+            tracing::warn!(
+                name = %name,
+                "Project sandbox profile '{name}' shadows a reserved built-in name; \
+                 it will be ignored in a future version that defines it as a built-in. \
+                 Rename the profile to avoid confusion."
+            );
+        }
         config.profiles.entry(name).or_insert(profile);
     }
 }
@@ -641,6 +659,47 @@ mod tests {
         };
 
         assert_eq!(mismatched_profile_names(&global, &project), vec!["dev"]);
+    }
+
+    #[test]
+    fn built_in_names_are_in_sync_with_parser() {
+        // Every name in built_in_profile_names() must parse to a non-Custom variant.
+        // This catches drift when someone adds a new built-in but forgets to update
+        // the registry.
+        for name in built_in_profile_names() {
+            let parsed: ProfileName = name.parse().unwrap();
+            assert!(
+                !matches!(parsed, ProfileName::Custom(_)),
+                "built_in_profile_names() includes '{name}' but from_str returns Custom — \
+                 add a match arm to ProfileName::from_str"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_project_profiles_warns_on_built_in_name() {
+        // A project profile named after a built-in triggers a warning at
+        // merge time. The profile IS still inserted (it's additive, and
+        // there's no global name to protect), but the user is told to
+        // rename it before a future version defines that built-in.
+        let mut config = SandboxConfig::default();
+        let project = SandboxConfig {
+            profiles: HashMap::from([(
+                "devbox".to_string(),
+                ProfileConfig {
+                    extends: Some("workspace".to_string()),
+                    restrict_network: None,
+                    read_only: vec![],
+                    read_write: vec![],
+                    deny: vec![],
+                },
+            )]),
+        };
+        merge_project_profiles(&mut config, project);
+        assert!(
+            config.profiles.contains_key("devbox"),
+            "project profile with built-in name must still be inserted"
+        );
     }
 
     #[test]
