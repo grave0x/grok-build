@@ -244,6 +244,15 @@ pub fn bwrap_reexec_command(
     if is_inside_bwrap() {
         return None;
     }
+    // Verify bwrap is installed before constructing the command.
+    if std::process::Command::new("bwrap")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("error: bwrap is required for sandbox read-deny enforcement but is not installed");
+        return None;
+    }
     let self_exe = std::env::current_exe().ok()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut cmd = std::process::Command::new("bwrap");
@@ -336,15 +345,30 @@ fn bwrap_blocked_placeholder(name: &str, want_dir: bool) -> Option<PathBuf> {
 /// Whether a profile write-denies `/data` via the devbox bwrap bind (built-in
 /// `devbox` or a custom profile that `extends = "devbox"`). This is a pure mount,
 /// so it applies even WITHOUT the `enforce` feature.
-#[cfg(target_os = "linux")]
+///
+/// On non-Linux platforms the `/data` write-deny is best-effort — warn once.
 fn is_devbox_based(profile: &ProfileName, config: &SandboxConfig) -> bool {
-    match profile {
+    let result = match profile {
         ProfileName::Devbox => true,
         ProfileName::Custom(name) => {
             config.profiles.get(name).and_then(|p| p.extends.as_deref()) == Some("devbox")
         }
         _ => false,
+    };
+    if result {
+        #[cfg(not(target_os = "linux"))]
+        {
+            static WARNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            WARNED.get_or_init(|| {
+                tracing::warn!(
+                    "Devbox /data write-deny requires bwrap (Linux only); \
+                     /data will be writable on this platform"
+                );
+                true
+            });
+        }
     }
+    result
 }
 /// Whether kernel read-deny enforcement is required. The single source of truth
 /// for this classification so callers (e.g. the shell's fail-closed startup path)
