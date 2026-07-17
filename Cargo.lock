@@ -13033,6 +13033,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-api-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "chrono",
+ "eventsource-stream",
+ "futures-util",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "urlencoding",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
 name = "xai-grok-auth"
 version = "0.1.0"
 dependencies = [
@@ -13043,6 +13065,52 @@ dependencies = [
  "reqwest-middleware 0.4.2",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "xai-grok-build-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs 5.0.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "xai-grok-api-client",
+ "xai-grok-build-config",
+]
+
+[[package]]
+name = "xai-grok-build-config"
+version = "0.1.0"
+dependencies = [
+ "dirs 5.0.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "xai-grok-build-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "futures",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "xai-grok-api-client",
+ "xai-grok-build-config",
 ]
 
 [[package]]
@@ -13581,6 +13649,7 @@ dependencies = [
 name = "xai-grok-secrets"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "regex",
  "serde_json",
  "url",

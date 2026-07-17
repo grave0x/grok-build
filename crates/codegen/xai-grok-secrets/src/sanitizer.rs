@@ -1,3 +1,4 @@
+use base64::Engine;
 use regex::{Regex, RegexSet};
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -31,8 +32,12 @@ static BEARER_TOKEN_REGEX: LazyLock<Regex> =
     LazyLock::new(|| compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{16,}\b"));
 /// Bare JWT (`eyJ...header.payload.signature`) with no `Bearer`/`sk-` prefix —
 /// the shape used by deployment keys and OIDC tokens.
+///
+/// Fast pre-filter via regex; `redact_secrets` additionally validates that the
+/// first segment base64-decodes to valid JSON to reject non-JWT false positives
+/// (see `is_likely_jwt`).
 static JWT_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"));
+    LazyLock::new(|| compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b"));
 /// 8-char value floor to avoid false positives on short values.
 static SECRET_ASSIGNMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     compile(
@@ -102,7 +107,13 @@ pub fn redact_secrets(input: &str) -> Cow<'_, str> {
     let s = VENDOR_TOKEN_REGEX.replace_all(&s, REDACTED);
     let s = GOOGLE_API_KEY_REGEX.replace_all(&s, REDACTED);
     let s = BEARER_TOKEN_REGEX.replace_all(&s, format!("Bearer {REDACTED}"));
-    let s = JWT_REGEX.replace_all(&s, REDACTED);
+    let s = JWT_REGEX.replace_all(&s, |caps: &regex::Captures<'_>| {
+        if is_likely_jwt(&caps[0]) {
+            REDACTED.to_string()
+        } else {
+            caps[0].to_string()
+        }
+    });
     let s = redact_urls_in(&s);
     let s = SECRET_ASSIGNMENT_REGEX
         .replace_all(&s, format!("$1$2$3{REDACTED}"))
@@ -319,6 +330,27 @@ fn compile(pattern: &str) -> Regex {
     Regex::new(pattern).unwrap_or_else(|e| panic!("invalid regex `{pattern}`: {e}"))
 }
 
+/// Validate that the first dot-separated segment of a candidate JWT string
+/// is valid base64url-encoded JSON. Rejects non-JWT strings that happen to
+/// match the `JWT_REGEX` shape (e.g. structured base64 triples in debug
+/// output).
+fn is_likely_jwt(s: &str) -> bool {
+    let header_end = match s.find('.') {
+        Some(pos) => pos,
+        None => return false,
+    };
+    // Must have at least "eyJ" (3 chars) plus one content char.
+    if header_end < 4 {
+        return false;
+    }
+    let header_b64 = &s[..header_end];
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +489,23 @@ mod tests {
             "deployment key eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4f",
         );
         assert!(!out.contains("eyJ"), "bare JWT survived redaction: {out}");
+    }
+
+    #[test]
+    fn non_jwt_eyj_triple_is_not_redacted() {
+        // Header `eyJBAAAA` decodes to `{"A\x00\x00\x00` which is NOT valid
+        // JSON, so `is_likely_jwt` rejects it.
+        let input = "eyJBAAAA.payload.signature";
+        let out = redact_secrets(input);
+        assert!(!out.contains(REDACTED), "non-JSON eyJ was redacted: {out}");
+    }
+
+    #[test]
+    fn valid_jwt_still_redacts() {
+        // `eyJhbGciOiJIUzI1NiJ9` decodes to `{"alg":"HS256"}` — valid JSON.
+        let input = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.fakesignature";
+        let out = redact_secrets(input);
+        assert!(out.contains(REDACTED), "valid JWT not redacted: {out}");
     }
 
     #[test]
