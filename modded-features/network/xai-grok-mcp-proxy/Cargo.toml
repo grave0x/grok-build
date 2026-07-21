@@ -1,0 +1,27 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-mcp-proxy"
+version = "0.1.0"
+edition.workspace = true
+description = "Smart proxy for MCP servers: circuit breaking, rate limiting, health checks, auto-restart, caching, and logging"
+
+[dependencies]
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+xai-circuit-breaker = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+
+[lints]
+workspace = true

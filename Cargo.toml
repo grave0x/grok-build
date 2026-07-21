@@ -82,6 +82,7 @@ members = [
     "crates/common/xai-tool-types",
     "crates/common/xai-tracing",
     "modded-features/security/xai-grok-audit",
+    "modded-features/network/xai-grok-mcp-proxy",
     "prod/mc/cli-chat-proxy-types",
     "third_party/dagre_rust",
     "third_party/graphlib_rust",
@@ -292,6 +293,7 @@ xai-grok-http = { path = "crates/codegen/xai-grok-http" }
 xai-grok-markdown = { path = "crates/codegen/xai-grok-markdown" }
 xai-grok-markdown-core = { path = "crates/codegen/xai-grok-markdown-core" }
 xai-grok-mcp = { path = "crates/codegen/xai-grok-mcp" }
+xai-grok-mcp-proxy = { path = "modded-features/network/xai-grok-mcp-proxy" }
 xai-grok-memory = { path = "crates/codegen/xai-grok-memory" }
 xai-grok-mermaid = { path = "crates/codegen/xai-grok-mermaid" }
 xai-grok-models = { path = "crates/codegen/xai-grok-models" }
