@@ -31,9 +31,11 @@ impl CryptoChainer {
 
         // Feed the previous link (or genesis sentinel).
         match prev_chain_hash {
-            Some(h) => _ = hasher.update(h.as_bytes()),
-            None => _ = hasher.update(b"genesis"),
-        }
+            Some(h) => hasher.update(h.as_bytes()),
+            None => hasher.update(b"genesis"),
+        };
+
+        // Feed the entry payload (excludes id and chain_hash itself).
 
         // Feed the entry payload (excludes id and chain_hash itself).
         hasher.update(b"||");
