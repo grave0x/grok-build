@@ -102,11 +102,19 @@ pub fn embedded_key_id_trusted(key_id: &str) -> bool {
 /// safe to read pre-verification because selection can only land within the trusted
 /// set (a forged id either misses or picks a key the signature won't match). Pure:
 /// callers supply the keys so tests can use throwaway keypairs.
+/// Maximum signed payload size: 128 KiB. Signed payloads are small JSON
+/// objects (key_id + optional deployment_id/team_id + permissions). A larger
+/// payload is a DoS attempt (OOM on deserialization).
+const MAX_SIGNED_PAYLOAD_SIZE: usize = 128 * 1024;
+
 pub fn verify_signed_payload(
     signed_payload: &str,
     signature_b64: &str,
     trusted_keys: &[(&str, &[u8])],
 ) -> Result<SignedPayload, SigError> {
+    if signed_payload.len() > MAX_SIGNED_PAYLOAD_SIZE {
+        return Err(SigError::BadPayload);
+    }
     let payload: SignedPayload =
         serde_json::from_str(signed_payload).map_err(|_| SigError::BadPayload)?;
     let (_, public_key) = trusted_keys

@@ -10,11 +10,31 @@ use crate::validation::{load_requirements, load_system_requirements};
 use crate::version_overrides::{self, apply_version_overrides};
 
 /// Load and parse a TOML file, expanding `$VAR` references. Empty table if absent.
+///
+/// # Security
+///
+/// System-level config files (`/etc/grok/`) should use [`load_system_toml_file`]
+/// instead to prevent env var injection by non-root users. Env var expansion
+/// in system files allows a user to influence admin-set config values by
+/// exporting variables before launching grok (e.g. `$PROXY_URL` → attacker-controlled).
 pub fn load_toml_file(path: &Path) -> std::io::Result<toml::Value> {
+    load_toml_file_impl(path, true)
+}
+
+/// Like [`load_toml_file`] but does NOT expand `$VAR` references. Use for
+/// root-owned system config files to prevent user env var injection into
+/// admin-set values.
+pub fn load_system_toml_file(path: &Path) -> std::io::Result<toml::Value> {
+    load_toml_file_impl(path, false)
+}
+
+fn load_toml_file_impl(path: &Path, expand_env: bool) -> std::io::Result<toml::Value> {
     match std::fs::read_to_string(path) {
         Ok(s) => match toml::from_str::<toml::Value>(&s) {
             Ok(mut v) => {
-                expand_env_vars_in_toml(&mut v);
+                if expand_env {
+                    expand_env_vars_in_toml(&mut v);
+                }
                 Ok(v)
             }
             Err(e) => {
@@ -104,7 +124,7 @@ fn load_user_config_layer(home: Option<&Path>, filename: &str) -> std::io::Resul
 
 pub fn load_system_managed_config() -> std::io::Result<toml::Value> {
     let mut v = match system_config_dir() {
-        Some(dir) => load_toml_file(&dir.join(MANAGED_CONFIG_FILENAME))?,
+        Some(dir) => load_system_toml_file(&dir.join(MANAGED_CONFIG_FILENAME))?,
         None => toml::Value::Table(toml::map::Map::new()),
     };
     apply_version_overrides_with_registered(&mut v)?;

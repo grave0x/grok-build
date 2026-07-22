@@ -360,7 +360,6 @@ pub(crate) fn expand_deny_globs(
     // not misattributed to a missing bubblewrap.
     let fail = |reason: String| -> Option<Vec<String>> {
         tracing::error!(%reason, "sandbox deny-glob expansion failed; refusing to start");
-        eprintln!("error: sandbox deny glob could not be enforced on Linux: {reason}");
         None
     };
 

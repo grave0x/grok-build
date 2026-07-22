@@ -81,10 +81,14 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 
 /// CWE-918: Validate a hook URL to prevent SSRF.
 ///
+/// Returns the resolved `SocketAddr`s for DNS-based hosts, so the caller can
+/// pin them in the HTTP client and prevent DNS rebinding. For literal IPs
+/// a caller may skip re-resolution entirely.
+///
 /// Requirements:
 /// - Only HTTPS scheme is allowed (reject HTTP / other schemes).
 /// - Resolved IP addresses must not be in private/link-local/metadata ranges.
-async fn validate_hook_url(url: &str) -> Result<(), String> {
+async fn validate_hook_url(url: &str) -> Result<HookUrlAddrs, String> {
     let parsed = Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
 
     // Restrict to HTTPS only.
@@ -104,10 +108,12 @@ async fn validate_hook_url(url: &str) -> Result<(), String> {
         if is_blocked_ip(&ip) {
             return Err(format!("URL resolves to blocked private/internal IP: {ip}"));
         }
-        return Ok(());
+        return Ok(HookUrlAddrs::LiteralIp);
     }
 
-    // DNS resolution check.
+    // DNS resolution check — resolved ONCE and returned so the HTTP client
+    // pins these addresses, preventing DNS rebinding between validation
+    // and the actual request.
     let port = parsed.port_or_known_default().unwrap_or(443);
     let addr_str = format!("{host}:{port}");
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr_str)
@@ -128,7 +134,15 @@ async fn validate_hook_url(url: &str) -> Result<(), String> {
         }
     }
 
-    Ok(())
+    Ok(HookUrlAddrs::Dns(host.to_owned(), addrs))
+}
+
+/// Result of [`validate_hook_url`]: either a literal IP (no re-resolution
+/// needed) or a hostname with pre-validated addresses to pin.
+#[derive(Debug)]
+enum HookUrlAddrs {
+    LiteralIp,
+    Dns(String, Vec<std::net::SocketAddr>),
 }
 
 /// Run a single HTTP hook.
@@ -197,20 +211,24 @@ pub async fn run_http_hook(
         }
     };
 
-    // CWE-918: Validate URL before sending any data.
-    if let Err(reason) = validate_hook_url(url).await {
-        tracing::warn!(
-            hook_name = %spec.name,
-            url = %log_url,
-            %reason,
-            "SSRF protection: blocked HTTP hook URL"
-        );
-        return (
-            HookRunnerResult::Failed(format!("blocked by SSRF protection: {reason}")),
-            start.elapsed(),
-            Some(make_info(None, None)),
-        );
-    }
+    // CWE-918: Validate URL before sending any data. Returns pre-resolved
+    // addresses so we can pin them in the HTTP client, preventing DNS rebinding.
+    let hook_addrs = match validate_hook_url(url).await {
+        Ok(addrs) => addrs,
+        Err(reason) => {
+            tracing::warn!(
+                hook_name = %spec.name,
+                url = %log_url,
+                %reason,
+                "SSRF protection: blocked HTTP hook URL"
+            );
+            return (
+                HookRunnerResult::Failed(format!("blocked by SSRF protection: {reason}")),
+                start.elapsed(),
+                Some(make_info(None, None)),
+            );
+        }
+    };
 
     let body = match serde_json::to_string(envelope) {
         Ok(j) => j,
@@ -223,10 +241,29 @@ pub async fn run_http_hook(
         }
     };
 
-    let client = reqwest::Client::builder()
+    let mut client_builder = reqwest::Client::builder()
         .timeout(Duration::from_millis(spec.timeout_ms))
-        .build()
-        .unwrap_or_default();
+        // CWE-918: prevent SSRF via server redirect to internal IP.
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none());
+    // Pin DNS to pre-validated addresses so a DNS rebind between validation
+    // and the actual request cannot redirect the payload to a private IP.
+    if let HookUrlAddrs::Dns(host, addrs) = &hook_addrs {
+        for addr in addrs {
+            client_builder = client_builder.resolve(host, *addr);
+        }
+    }
+    let client = match client_builder.build() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "HTTP client builder failed");
+            return (
+                HookRunnerResult::Failed("http client builder failed".into()),
+                start.elapsed(),
+                None,
+            );
+        }
+    };
 
     let response = match client
         .post(url)

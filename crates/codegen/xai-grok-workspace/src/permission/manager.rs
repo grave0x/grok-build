@@ -706,11 +706,13 @@ impl BashGrantOpts {
         conservative_blanket: false,
     };
     /// Post-classify bash arm; blanket only when auto did not force a prompt.
+    /// `conservative_blanket` is true so undecomposable scripts always require
+    /// an exact `allowed_bash_commands` match, never a blanket allow_bash_execute.
     fn post_classify(auto_forced_prompt: bool) -> Self {
         Self {
             honor_safe_lists: true,
             allow_blanket: !auto_forced_prompt,
-            conservative_blanket: false,
+            conservative_blanket: true,
         }
     }
 }
@@ -1340,9 +1342,12 @@ fn spawn_permission_manager_with_pin(
                     // Each auto-resolution carries its `decision_reason` trigger:
                     // safe_command / persisted_grant / session_deny. `None` prompts.
                     let mut pre_decision: Option<(Decision, &'static str)> = match &access {
-                        // An `Ask` rule on Read/Grep must reach the prompt, not the
-                        // unconditional auto-allow below (deny is already enforced earlier).
-                        AccessKind::Read(_) | AccessKind::Grep { .. } if policy_forced_prompt => {
+                        // An `Ask` rule on Read/Grep/WebSearch must reach the prompt,
+                        // not the unconditional auto-allow below (deny is already
+                        // enforced earlier).
+                        AccessKind::Read(_) | AccessKind::Grep { .. } | AccessKind::WebSearch(_)
+                            if policy_forced_prompt =>
+                        {
                             None
                         }
                         AccessKind::Read(_) => Some((Decision::Allow, reasons::SAFE_COMMAND)),

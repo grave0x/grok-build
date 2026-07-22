@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::env_bool;
-use crate::loader::{apply_version_overrides_with_registered, load_toml_file};
+use crate::loader::apply_version_overrides_with_registered;
 use crate::paths::{system_config_dir, user_grok_home};
 use crate::version_overrides::{VersionOverrideError, apply_version_overrides};
 
@@ -64,7 +64,7 @@ pub struct RequirementsLayer {
 pub fn requirements_layers() -> Vec<RequirementsLayer> {
     let mut out = Vec::new();
     if let Some(user_path) = user_grok_home().map(|g| g.join("requirements.toml"))
-        && let Some(value) = load_requirements_layer(&user_path)
+        && let Some(value) = load_requirements_layer(&user_path, false)
     {
         out.push(RequirementsLayer {
             value,
@@ -74,9 +74,25 @@ pub fn requirements_layers() -> Vec<RequirementsLayer> {
     }
     if let Some(dir) = system_config_dir() {
         let sys_path = dir.join("requirements.toml");
-        if let Some(value) = load_requirements_layer(&sys_path) {
+        if let Some(value) = load_requirements_layer(&sys_path, true) {
             out.push(RequirementsLayer {
                 value,
+                source: RequirementsSource::File(sys_path),
+                is_system: true,
+            });
+        } else if sys_path.is_file() {
+            // System config exists but is corrupt/unparseable — fail closed
+            // rather than silently losing the admin's yolo_pin enforcement.
+            tracing::error!(
+                path = %sys_path.display(),
+                "system requirements.toml exists but could not be loaded; \
+                 treating as disable_bypass_permissions_mode = true"
+            );
+            let pin_value: toml::Value = toml::from_str(
+                "[ui]\ndisable_bypass_permissions_mode = true\n"
+            ).expect("static inline toml is valid");
+            out.push(RequirementsLayer {
+                value: pin_value,
                 source: RequirementsSource::File(sys_path),
                 is_system: true,
             });
@@ -113,18 +129,32 @@ pub(crate) fn load_requirements() -> Option<toml::Value> {
 /// User requirements layer from `<home>/requirements.toml`, or `None` with no
 /// resolvable user home (rather than reading a cwd-relative `.grok`).
 fn load_user_requirements(home: Option<&Path>) -> Option<toml::Value> {
-    load_requirements_layer(&home?.join("requirements.toml"))
+    load_requirements_layer(&home?.join("requirements.toml"), false)
 }
 
 pub(crate) fn load_system_requirements() -> Option<toml::Value> {
     let dir = system_config_dir()?;
-    load_requirements_layer(&dir.join("requirements.toml"))
+    load_requirements_layer(&dir.join("requirements.toml"), true)
 }
 
 /// Soft-fails on errors; fail-closed enforcement lives in
 /// [`validate_requirements`].
-pub(crate) fn load_requirements_layer(path: &Path) -> Option<toml::Value> {
-    let v = match load_toml_file(path) {
+///
+/// # Security
+///
+/// System-level paths (root-owned `/etc/grok/`) must pass `true` for
+/// `is_system` to prevent env var injection by non-root users.
+/// User-level paths pass `false` (env vars expand for `$HOME` etc).
+pub(crate) fn load_requirements_layer(path: &Path, is_system: bool) -> Option<toml::Value> {
+    // System files use load_system_toml_file (no env var expansion) to
+    // prevent non-root users from influencing admin-set values via $VAR
+    // exports. User files use load_toml_file (expansion on) for $HOME etc.
+    let v = if is_system {
+        crate::loader::load_system_toml_file(path)
+    } else {
+        crate::loader::load_toml_file(path)
+    };
+    let v = match v {
         Ok(v) if v.as_table().is_some_and(|t| !t.is_empty()) => v,
         _ => return None,
     };
@@ -181,8 +211,20 @@ pub enum RequirementsError {
 /// Re-reads the file independently from [`load_requirements_layer`]:
 /// at startup both run, costing one extra small read per layer. Sharing
 /// the parse would couple loader+validator APIs for negligible gain.
-pub(crate) fn validate_requirements_layer(path: &Path) -> Result<(), RequirementsError> {
-    let Ok(v) = load_toml_file(path) else {
+///
+/// # Security
+///
+/// System-level paths (root-owned `/etc/grok/`) must pass `true` for
+/// `is_system` to prevent env var injection by non-root users.
+pub(crate) fn validate_requirements_layer(
+    path: &Path,
+    is_system: bool,
+) -> Result<(), RequirementsError> {
+    let Ok(v) = (if is_system {
+        crate::loader::load_system_toml_file(path)
+    } else {
+        crate::loader::load_toml_file(path)
+    }) else {
         return Ok(());
     };
     validate_requirements_value(v, &RequirementsSource::File(path.to_path_buf()))
@@ -218,7 +260,7 @@ fn validate_requirements_value(
 pub fn validate_requirements() -> Result<(), RequirementsError> {
     validate_user_requirements(user_grok_home().as_deref())?;
     if let Some(dir) = system_config_dir() {
-        validate_requirements_layer(&dir.join("requirements.toml"))?;
+        validate_requirements_layer(&dir.join("requirements.toml"), true)?;
     }
     // MDM uses the raw value (fail_closed intact) so it's enforced like the files.
     if let Some(mdm) = crate::macos_managed::managed_preferences_requirements() {
@@ -231,7 +273,7 @@ pub fn validate_requirements() -> Result<(), RequirementsError> {
 /// no-op (no cwd-relative `.grok/requirements.toml` is read or enforced).
 fn validate_user_requirements(home: Option<&Path>) -> Result<(), RequirementsError> {
     match home {
-        Some(g) => validate_requirements_layer(&g.join("requirements.toml")),
+        Some(g) => validate_requirements_layer(&g.join("requirements.toml"), false),
         None => Ok(()),
     }
 }
@@ -267,7 +309,7 @@ telemetry = true
         )
         .unwrap();
 
-        assert!(load_requirements_layer(&path).is_none());
+        assert!(load_requirements_layer(&path, false).is_none());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -289,7 +331,7 @@ minimum_version = "not-a-version"
         )
         .unwrap();
 
-        let err = validate_requirements_layer(&path).unwrap_err();
+        let err = validate_requirements_layer(&path, false).unwrap_err();
         assert!(matches!(
             err,
             RequirementsError::InvalidVersionOverrides { .. }
@@ -314,7 +356,7 @@ minimum_version = "not-a-version"
         )
         .unwrap();
 
-        assert!(validate_requirements_layer(&path).is_ok());
+        assert!(validate_requirements_layer(&path, false).is_ok());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -373,7 +415,7 @@ minimum_version = "not-a-version"
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "fail_closed = true\n[features]\ntelemetry = true\n").unwrap();
 
-        let result = load_requirements_layer(&path).unwrap();
+        let result = load_requirements_layer(&path, false).unwrap();
         assert!(
             result.get(FAIL_CLOSED_KEY).is_none(),
             "fail_closed must not leak into the returned config"

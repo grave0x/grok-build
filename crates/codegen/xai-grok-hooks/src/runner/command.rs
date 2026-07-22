@@ -76,6 +76,7 @@ pub async fn run_command_hook(
     // Otherwise, treat it as a direct executable path (resolve relative
     // paths from the hook file's directory).
     let is_shell_command = command_str.contains(' ')
+        || command_str.contains('`')
         || command_str.contains('|')
         || command_str.contains('&')
         || command_str.contains(';')

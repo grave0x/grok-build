@@ -1,0 +1,19 @@
+[package]
+license = "Apache-2.0"
+name = "xai-grok-router"
+version = "0.1.0"
+edition.workspace = true
+description = "Model router for Grok Build — intelligent model selection based on task complexity, cost, and latency requirements"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

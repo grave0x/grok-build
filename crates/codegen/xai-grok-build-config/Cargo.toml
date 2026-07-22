@@ -1,0 +1,17 @@
+[package]
+name = "xai-grok-build-config"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "User-facing config for grok-build CLI/TUI — TOML parsing, env overrides, validation"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

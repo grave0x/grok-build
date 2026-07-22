@@ -27,6 +27,7 @@
 //! sandbox.install();
 //! ```
 pub mod child_net;
+mod cgroup;
 mod deny;
 mod logging;
 mod paths;
@@ -36,7 +37,8 @@ pub use logging::SandboxLogger;
 #[cfg(all(feature = "enforce", unix))]
 use nono::Sandbox;
 pub use profiles::{
-    ProfileName, SandboxConfig, SandboxProfile, load_sandbox_config, sandbox_profile_conflicts,
+    ProfileName, SandboxConfig, SandboxProfile, SandboxSelectionConfig, load_sandbox_config,
+    sandbox_profile_conflicts,
 };
 use std::path::Path;
 #[cfg(any(target_os = "linux", all(feature = "enforce", test)))]
@@ -119,6 +121,8 @@ pub struct SandboxManager {
     profile: ProfileName,
     logger: SandboxLogger,
     net_restricted: bool,
+    network_allow: Vec<String>,
+    network_deny: Vec<String>,
     applied: bool,
 }
 impl SandboxManager {
@@ -129,6 +133,8 @@ impl SandboxManager {
             profile,
             logger: SandboxLogger::new(),
             net_restricted,
+            network_allow: Vec::new(),
+            network_deny: Vec::new(),
             applied: false,
         }
     }
@@ -159,7 +165,17 @@ impl SandboxManager {
             .to_capability_set_with_config(workspace, &config)?;
         let mut resolved = self.profile.resolve_profile(workspace, &config)?;
         resolved.deny = deny::effective_deny_paths(workspace, &resolved.deny);
+        cgroup::setup_limits(
+            resolved.cpu_quota.as_deref(),
+            resolved.memory_max.as_deref(),
+            resolved.io_weight.as_deref(),
+        );
         self.net_restricted = self.profile.restricts_network_resolved(&config);
+        self.network_allow = resolved.network_allow.clone();
+        self.network_deny = resolved.network_deny.clone();
+        if !self.network_allow.is_empty() || !self.network_deny.is_empty() {
+            self.net_restricted = true;
+        }
         match Sandbox::apply(&caps) {
             Ok(_) => {
                 self.applied = true;
@@ -223,6 +239,14 @@ impl SandboxManager {
     pub fn restrict_child_network(&self) -> bool {
         self.applied && self.net_restricted
     }
+    /// Hostnames/IPs allowed for child network (empty = no allowlist).
+    pub fn network_allow(&self) -> &[String] {
+        &self.network_allow
+    }
+    /// Hostnames/IPs denied for child network (empty = no denylist).
+    pub fn network_deny(&self) -> &[String] {
+        &self.network_deny
+    }
     /// The active profile name.
     pub fn profile(&self) -> &ProfileName {
         &self.profile
@@ -240,6 +264,7 @@ impl SandboxManager {
 pub fn bwrap_reexec_command(
     deny_write: &[&str],
     deny_read: &[&str],
+    tmpfs_size: Option<&str>,
 ) -> Option<std::process::Command> {
     if is_inside_bwrap() {
         return None;
@@ -250,7 +275,7 @@ pub fn bwrap_reexec_command(
         .output()
         .is_err()
     {
-        eprintln!("error: bwrap is required for sandbox read-deny enforcement but is not installed");
+        tracing::error!("bwrap is required for sandbox read-deny enforcement but is not installed");
         return None;
     }
     let self_exe = std::env::current_exe().ok()?;
@@ -266,8 +291,9 @@ pub fn bwrap_reexec_command(
     if !deny_read.is_empty() {
         for path in deny_read {
             let Some(blocked) = bwrap_blocked_source_for_path(Path::new(path)) else {
-                eprintln!(
-                    "error: could not create bwrap placeholder for read-deny path {path}; \
+                tracing::error!(
+                    path,
+                    "could not create bwrap placeholder for read-deny path; \
                      refusing to start with a partial sandbox"
                 );
                 return None;
@@ -279,6 +305,9 @@ pub fn bwrap_reexec_command(
     let _ = deny_read;
     cmd.arg("--dev-bind").arg("/dev").arg("/dev");
     cmd.arg("--proc").arg("/proc");
+    if let Some(size) = tmpfs_size {
+        cmd.arg("--tmpfs").arg(format!("/tmp:size={size}"));
+    }
     cmd.env(BWRAP_ENV_VAR, "1");
     cmd.arg("--").arg(self_exe).args(args);
     Some(cmd)
@@ -493,12 +522,21 @@ pub fn bwrap_reexec_for_profile(
         deny_read,
         has_globs,
     } = bwrap_deny_plan(profile, workspace)?;
-    if deny_write.is_empty() && deny_read.is_empty() && !has_globs {
+    let config = profiles::load_sandbox_config(workspace);
+    let tmpfs_size = if *profile != ProfileName::Off {
+        profile
+            .resolve_profile(workspace, &config)
+            .ok()
+            .and_then(|r| r.tmpfs_size.clone())
+    } else {
+        None
+    };
+    if deny_write.is_empty() && deny_read.is_empty() && !has_globs && tmpfs_size.is_none() {
         return None;
     }
     let write_refs: Vec<&str> = deny_write.iter().map(String::as_str).collect();
     let read_refs: Vec<&str> = deny_read.iter().map(String::as_str).collect();
-    bwrap_reexec_command(&write_refs, &read_refs)
+    bwrap_reexec_command(&write_refs, &read_refs, tmpfs_size.as_deref())
 }
 #[cfg(test)]
 mod tests {
@@ -533,7 +571,7 @@ mod tests {
     #[serial(bwrap_env)]
     fn bwrap_reexec_returns_none_inside_bwrap() {
         let _g = EnvGuard::set(BWRAP_ENV_VAR, "1");
-        let result = bwrap_reexec_command(&["/data"], &[]);
+        let result = bwrap_reexec_command(&["/data"], &[], None);
         assert!(
             result.is_none(),
             "should return None when already inside bwrap"
@@ -543,7 +581,7 @@ mod tests {
     #[serial(bwrap_env)]
     fn bwrap_reexec_returns_some_outside_bwrap() {
         let _g = EnvGuard::remove(BWRAP_ENV_VAR);
-        let result = bwrap_reexec_command(&["/tmp"], &[]);
+        let result = bwrap_reexec_command(&["/tmp"], &[], None);
         assert!(result.is_some(), "should return Some when not inside bwrap");
         let cmd = result.unwrap();
         assert_eq!(cmd.get_program(), "bwrap", "program should be bwrap");
@@ -568,7 +606,7 @@ mod tests {
     #[serial(bwrap_env)]
     fn bwrap_reexec_skips_nonexistent_paths() {
         let _g = EnvGuard::remove(BWRAP_ENV_VAR);
-        let result = bwrap_reexec_command(&["/nonexistent-test-path-xyz-12345"], &[]);
+        let result = bwrap_reexec_command(&["/nonexistent-test-path-xyz-12345"], &[], None);
         let cmd = result.unwrap();
         let args: Vec<String> = cmd
             .get_args()
@@ -585,7 +623,7 @@ mod tests {
     fn bwrap_reexec_binds_nonexistent_deny_read_paths() {
         let _g = EnvGuard::remove(BWRAP_ENV_VAR);
         let missing = "/nonexistent-deny-read-path-xyz-12345";
-        let result = bwrap_reexec_command(&[], &[missing]);
+        let result = bwrap_reexec_command(&[], &[missing], None);
         let cmd = result.unwrap();
         let args: Vec<String> = cmd
             .get_args()
@@ -603,7 +641,7 @@ mod tests {
     #[serial(bwrap_env)]
     fn bwrap_reexec_mounts_existing_paths_read_only() {
         let _g = EnvGuard::remove(BWRAP_ENV_VAR);
-        let result = bwrap_reexec_command(&["/tmp"], &[]);
+        let result = bwrap_reexec_command(&["/tmp"], &[], None);
         let cmd = result.unwrap();
         let args: Vec<String> = cmd
             .get_args()
@@ -619,7 +657,7 @@ mod tests {
     #[serial(bwrap_env)]
     fn bwrap_reexec_uses_dev_bind() {
         let _g = EnvGuard::remove(BWRAP_ENV_VAR);
-        let result = bwrap_reexec_command(&[], &[]);
+        let result = bwrap_reexec_command(&[], &[], None);
         let cmd = result.unwrap();
         let args: Vec<String> = cmd
             .get_args()
@@ -686,7 +724,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("grok-deny-dir-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_string_lossy().to_string();
-        let result = bwrap_reexec_command(&[], &[&dir_str]);
+        let result = bwrap_reexec_command(&[], &[&dir_str], None);
         let cmd = result.unwrap();
         let args: Vec<String> = cmd
             .get_args()
@@ -753,5 +791,117 @@ mod tests {
             "non-devbox custom with no deny needs no re-exec"
         );
         let _ = std::fs::remove_dir_all(&ws_ws);
+    }
+    #[test]
+    #[serial(bwrap_env)]
+    fn bwrap_reexec_appends_tmpfs_when_size_given() {
+        let _g = EnvGuard::remove(BWRAP_ENV_VAR);
+        let result = bwrap_reexec_command(&[], &[], Some("512M"));
+        let cmd = result.unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == "/tmp:size=512M"),
+            "expected --tmpfs /tmp:size=512M, got args: {args:?}"
+        );
+    }
+    #[test]
+    #[serial(bwrap_env)]
+    fn bwrap_reexec_no_tmpfs_when_size_none() {
+        let _g = EnvGuard::remove(BWRAP_ENV_VAR);
+        let result = bwrap_reexec_command(&[], &[], None);
+        let cmd = result.unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !args.contains(&"--tmpfs".to_string()),
+            "should not include --tmpfs when size is None, got args: {args:?}"
+        );
+    }
+    #[test]
+    #[serial(bwrap_env)]
+    #[cfg(all(feature = "enforce", unix))]
+    fn bwrap_reexec_for_profile_triggers_on_tmpfs_size_alone() {
+        let _g = EnvGuard::remove(BWRAP_ENV_VAR);
+        let ws = temp_workspace_with_sandbox_toml(
+            "tmpfs-size",
+            "[profiles.custom-tmpfs]\nextends = \"workspace\"\ntmpfs_size = \"256M\"\n",
+        );
+        let cmd = bwrap_reexec_for_profile(
+            &ProfileName::Custom("custom-tmpfs".to_string()),
+            &ws,
+        );
+        assert!(
+            cmd.is_some(),
+            "profile with tmpfs_size alone should trigger re-exec"
+        );
+        let args: Vec<String> = cmd
+            .unwrap()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == "/tmp:size=256M"),
+            "expected --tmpfs /tmp:size=256M, got args: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+    #[test]
+    #[serial(bwrap_env)]
+    #[cfg(all(feature = "enforce", unix))]
+    fn bwrap_reexec_for_profile_skips_tmpfs_on_off() {
+        let result = bwrap_reexec_for_profile(&ProfileName::Off, &std::env::temp_dir());
+        assert!(
+            result.is_none(),
+            "Off profile should not trigger re-exec"
+        );
+    }
+    #[test]
+    #[cfg(all(feature = "enforce", unix))]
+    fn sandbox_manager_stores_network_lists() {
+        let ws = temp_workspace_with_sandbox_toml(
+            "netlist",
+            "[profiles.netlist]\nextends = \"workspace\"\n\
+             network_allow = [\"api.example.com\"]\n\
+             network_deny = [\"evil.example.com\"]\n",
+        );
+        let mut manager = SandboxManager::new(
+            ProfileName::Custom("netlist".to_string()),
+            &ws,
+        );
+        let _ = manager.apply(&ws);
+        // When apply resolves the profile (supported platform), lists are populated.
+        // On unsupported platforms they remain empty — both outcomes are valid.
+        if manager.is_applied() {
+            assert_eq!(manager.network_allow(), &["api.example.com"]);
+            assert_eq!(manager.network_deny(), &["evil.example.com"]);
+        } else {
+            assert!(manager.network_allow().is_empty());
+            assert!(manager.network_deny().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+    #[test]
+    #[cfg(all(feature = "enforce", unix))]
+    fn sandbox_manager_network_allow_triggers_restrict() {
+        let ws = temp_workspace_with_sandbox_toml(
+            "net-allow-only",
+            "[profiles.netallowonly]\nextends = \"workspace\"\n\
+             network_allow = [\"api.example.com\"]\n",
+        );
+        let mut manager = SandboxManager::new(
+            ProfileName::Custom("netallowonly".to_string()),
+            &ws,
+        );
+        let _ = manager.apply(&ws);
+        if manager.is_applied() {
+            assert!(manager.restrict_child_network(),
+                "network_allow should force restrict_child_network to true when applied");
+        }
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

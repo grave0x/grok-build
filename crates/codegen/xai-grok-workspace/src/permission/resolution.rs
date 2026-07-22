@@ -874,7 +874,14 @@ fn parse_managed_settings_permissions(
     };
     let permissions: ParsedPermissions = match serde_json::from_value(perms_value.clone()) {
         Ok(p) => p,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "managed-settings.json 'permissions' block parse failed; no rules loaded"
+            );
+            return Vec::new();
+        }
     };
     let (config, warnings) = permissions.into_permission_config();
     for w in &warnings {

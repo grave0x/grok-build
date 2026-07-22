@@ -35,6 +35,18 @@ pub struct SandboxProfile {
     pub default_read: bool,
     /// Whether child processes should have network blocked
     pub restrict_network: bool,
+    /// Size of tmpfs mounted at /tmp (e.g. "512M", "2G")
+    pub tmpfs_size: Option<String>,
+    /// CPU quota for child processes (e.g. "50%" or cgroup cpu.max)
+    pub cpu_quota: Option<String>,
+    /// Memory limit for child processes (e.g. "1G", "512M")
+    pub memory_max: Option<String>,
+    /// IO weight for child processes (e.g. "100")
+    pub io_weight: Option<String>,
+    /// Network allowlist — IPs/domains allowed despite restrict_network
+    pub network_allow: Vec<String>,
+    /// Network denylist — IPs/domains denied
+    pub network_deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -49,12 +61,121 @@ pub struct ProfileConfig {
     pub read_write: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+    #[serde(default)]
+    pub network_allow: Vec<String>,
+    #[serde(default)]
+    pub network_deny: Vec<String>,
+    #[serde(default)]
+    pub cpu_quota: Option<String>,
+    #[serde(default)]
+    pub memory_max: Option<String>,
+    #[serde(default)]
+    pub io_weight: Option<String>,
+    #[serde(default)]
+    pub tmpfs_size: Option<String>,
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+/// Profile selection rules: explicit name, command-prefix matching, and
+/// repo-based matching. Loaded from `[sandbox]` in config.toml.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SandboxSelectionConfig {
+    /// Explicitly chosen profile name (highest priority)
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Map of command prefix → profile name (e.g. "npm publish" → "strict")
+    #[serde(default)]
+    pub profile_by_command: HashMap<String, String>,
+    /// Map of repo URL → profile name
+    #[serde(default)]
+    pub profile_by_repo: HashMap<String, String>,
+    /// Fallback profile name when nothing else matches
+    #[serde(default)]
+    pub default_profile: Option<String>,
+}
+
+impl Default for SandboxSelectionConfig {
+    fn default() -> Self {
+        Self {
+            profile: None,
+            profile_by_command: HashMap::new(),
+            profile_by_repo: HashMap::new(),
+            default_profile: Some("workspace".to_string()),
+        }
+    }
+}
+
+impl SandboxSelectionConfig {
+    /// Resolve a profile name from the selection rules.
+    ///
+    /// Priority:
+    /// 1. Explicit `profile` field
+    /// 2. `profile_by_command` — longest prefix match against `command`
+    /// 3. `profile_by_repo` — exact match or suffix match against `repo_url`
+    /// 4. `default_profile`
+    pub fn resolve_profile_name(
+        &self,
+        command: Option<&str>,
+        repo_url: Option<&str>,
+    ) -> ProfileName {
+        // 1. Explicit profile
+        if let Some(name) = &self.profile {
+            let parsed: ProfileName = name.parse().unwrap_or(ProfileName::Custom(name.clone()));
+            return parsed;
+        }
+
+        // 2. Command prefix match
+        if let Some(cmd) = command {
+            // Find longest matching command prefix
+            let mut best_len = 0usize;
+            let mut best_name: Option<&str> = None;
+            for (prefix, pname) in &self.profile_by_command {
+                if cmd.starts_with(prefix) && prefix.len() > best_len {
+                    best_len = prefix.len();
+                    best_name = Some(pname);
+                }
+            }
+            if let Some(name) = best_name {
+                return name.parse().unwrap_or(ProfileName::Custom(name.to_string()));
+            }
+        }
+
+        // 3. Repo URL match
+        if let Some(url) = repo_url {
+            // Exact match first, then suffix match
+            if let Some(name) = self.profile_by_repo.get(url) {
+                return name.parse().unwrap_or(ProfileName::Custom(name.to_string()));
+            }
+            // Suffix match: find longest matching repo URL suffix
+            let mut best_len = 0usize;
+            let mut best_name: Option<&str> = None;
+            for (repo_key, pname) in &self.profile_by_repo {
+                if url.ends_with(repo_key) && repo_key.len() > best_len {
+                    best_len = repo_key.len();
+                    best_name = Some(pname);
+                }
+            }
+            if let Some(name) = best_name {
+                return name.parse().unwrap_or(ProfileName::Custom(name.to_string()));
+            }
+        }
+
+        // 4. Default
+        self.default_profile
+            .as_deref()
+            .unwrap_or("workspace")
+            .parse()
+            .unwrap_or(ProfileName::Workspace)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SandboxConfig {
     #[serde(default)]
     pub profiles: HashMap<String, ProfileConfig>,
+    #[serde(default)]
+    pub selection: SandboxSelectionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -326,6 +447,12 @@ impl ProfileName {
                 deny: vec![],
                 default_read: true,
                 restrict_network: false,
+                tmpfs_size: None,
+                cpu_quota: None,
+                memory_max: None,
+                io_weight: None,
+                network_allow: vec![],
+                network_deny: vec![],
             }),
 
             Self::Devbox => {
@@ -364,6 +491,12 @@ impl ProfileName {
                     deny: vec![],
                     default_read: true,
                     restrict_network: false,
+                    tmpfs_size: None,
+                    cpu_quota: None,
+                    memory_max: None,
+                    io_weight: None,
+                    network_allow: vec![],
+                    network_deny: vec![],
                 })
             }
 
@@ -374,6 +507,12 @@ impl ProfileName {
                 deny: vec![],
                 default_read: true,
                 restrict_network: true,
+                tmpfs_size: None,
+                cpu_quota: None,
+                memory_max: None,
+                io_weight: None,
+                network_allow: vec![],
+                network_deny: vec![],
             }),
 
             Self::Strict => {
@@ -406,6 +545,12 @@ impl ProfileName {
                     deny: vec![],
                     default_read: false,
                     restrict_network: true,
+                    tmpfs_size: None,
+                    cpu_quota: None,
+                    memory_max: None,
+                    io_weight: None,
+                    network_allow: vec![],
+                    network_deny: vec![],
                 })
             }
 
@@ -463,6 +608,28 @@ impl ProfileName {
                 // Add custom deny paths
                 for path_str in &profile_config.deny {
                     profile.deny.push(PathBuf::from(path_str));
+                }
+
+                // Override resource limit fields
+                if let Some(v) = &profile_config.tmpfs_size {
+                    profile.tmpfs_size = Some(v.clone());
+                }
+                if let Some(v) = &profile_config.cpu_quota {
+                    profile.cpu_quota = Some(v.clone());
+                }
+                if let Some(v) = &profile_config.memory_max {
+                    profile.memory_max = Some(v.clone());
+                }
+                if let Some(v) = &profile_config.io_weight {
+                    profile.io_weight = Some(v.clone());
+                }
+
+                // Override network filter fields
+                if !profile_config.network_allow.is_empty() {
+                    profile.network_allow = profile_config.network_allow.clone();
+                }
+                if !profile_config.network_deny.is_empty() {
+                    profile.network_deny = profile_config.network_deny.clone();
                 }
 
                 Ok(profile)
@@ -584,8 +751,16 @@ mod tests {
                     read_only: vec!["/data".to_string()],
                     read_write: vec![],
                     deny: vec!["/data/private".to_string()],
+                    network_allow: vec![],
+                    network_deny: vec![],
+                    cpu_quota: None,
+                    memory_max: None,
+                    io_weight: None,
+                    tmpfs_size: None,
+                    proxy: None,
                 },
             )]),
+            selection: SandboxSelectionConfig::default(),
         };
 
         let profile = ProfileName::Custom("project".to_string());
@@ -609,9 +784,18 @@ mod tests {
                     read_only: vec![],
                     read_write: vec![],
                     deny: vec![],
+                    network_allow: vec![],
+                    network_deny: vec![],
+                    cpu_quota: None,
+                    memory_max: None,
+                    io_weight: None,
+                    tmpfs_size: None,
+                    proxy: None,
                 },
             )]),
+            selection: SandboxSelectionConfig::default(),
         };
+
         let profile = ProfileName::Custom("mydev".to_string());
         let resolved = profile.resolve_profile(&workspace, &config).unwrap();
         assert!(
@@ -642,12 +826,20 @@ mod tests {
             read_only: vec![],
             read_write: vec![],
             deny: vec![],
+            network_allow: vec![],
+            network_deny: vec![],
+            cpu_quota: None,
+            memory_max: None,
+            io_weight: None,
+            tmpfs_size: None,
+            proxy: None,
         };
         let global = SandboxConfig {
             profiles: HashMap::from([
                 ("dev".to_string(), profile(false)),
                 ("same".to_string(), profile(false)),
             ]),
+            selection: SandboxSelectionConfig::default(),
         };
         let project = SandboxConfig {
             profiles: HashMap::from([
@@ -656,6 +848,7 @@ mod tests {
                 ("project-only".to_string(), profile(true)),
                 ("devbox".to_string(), profile(true)),
             ]),
+            selection: SandboxSelectionConfig::default(),
         };
 
         assert_eq!(mismatched_profile_names(&global, &project), vec!["dev"]);
@@ -692,8 +885,16 @@ mod tests {
                     read_only: vec![],
                     read_write: vec![],
                     deny: vec![],
+                    network_allow: vec![],
+                    network_deny: vec![],
+                    cpu_quota: None,
+                    memory_max: None,
+                    io_weight: None,
+                    tmpfs_size: None,
+                    proxy: None,
                 },
             )]),
+            selection: SandboxSelectionConfig::default(),
         };
         merge_project_profiles(&mut config, project);
         assert!(
@@ -735,8 +936,16 @@ read_write = ["/tmp/ci-artifacts"]
                     read_only: vec![],
                     read_write: vec![],
                     deny: vec!["/home/user/.ssh".to_string()],
+                    network_allow: vec![],
+                    network_deny: vec![],
+                    cpu_quota: None,
+                    memory_max: None,
+                    io_weight: None,
+                    tmpfs_size: None,
+                    proxy: None,
                 },
             )]),
+            selection: SandboxSelectionConfig::default(),
         };
         let project = SandboxConfig {
             profiles: HashMap::from([
@@ -748,6 +957,13 @@ read_write = ["/tmp/ci-artifacts"]
                         read_only: vec![],
                         read_write: vec!["/".to_string()],
                         deny: vec![],
+                        network_allow: vec![],
+                        network_deny: vec![],
+                        cpu_quota: None,
+                        memory_max: None,
+                        io_weight: None,
+                        tmpfs_size: None,
+                        proxy: None,
                     },
                 ),
                 (
@@ -758,9 +974,17 @@ read_write = ["/tmp/ci-artifacts"]
                         read_only: vec![],
                         read_write: vec![],
                         deny: vec!["./secrets".to_string()],
+                        network_allow: vec![],
+                        network_deny: vec![],
+                        cpu_quota: None,
+                        memory_max: None,
+                        io_weight: None,
+                        tmpfs_size: None,
+                        proxy: None,
                     },
                 ),
             ]),
+            selection: SandboxSelectionConfig::default(),
         };
 
         merge_project_profiles(&mut config, project);
@@ -794,8 +1018,16 @@ read_write = ["/tmp/ci-artifacts"]
                     read_only: vec![],
                     read_write: vec![],
                     deny: vec![],
+                    network_allow: vec![],
+                    network_deny: vec![],
+                    cpu_quota: None,
+                    memory_max: None,
+                    io_weight: None,
+                    tmpfs_size: None,
+                    proxy: None,
                 },
             )]),
+            selection: SandboxSelectionConfig::default(),
         };
         let err = ProfileName::Custom("broken".to_string())
             .resolve_profile(&workspace, &config)

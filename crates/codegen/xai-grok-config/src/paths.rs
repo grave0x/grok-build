@@ -27,7 +27,11 @@ const CLAUDE_MANAGED_SETTINGS_PATH: &str = "/etc/claude-code/managed-settings.js
 /// `xai_fast_worktree::db::resolve_grok_home` (deliberately standalone crate).
 pub fn default_grok_home() -> PathBuf {
     #[allow(deprecated)]
-    let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let Some(home) = std::env::home_dir() else {
+        // CWE-22: no $HOME → use a stable fallback, not cwd-relative `.grok`
+        // which could point into an attacker-controlled directory.
+        return PathBuf::from("/tmp/.grok");
+    };
     dunce::canonicalize(&home).unwrap_or(home).join(".grok")
 }
 

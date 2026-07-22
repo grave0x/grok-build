@@ -501,7 +501,20 @@ pub fn resolve_model_path(
             return cwd.join(suffix);
         }
     }
-    cwd.join(input_path)
+    let resolved = cwd.join(input_path);
+    // Canonicalize to strip `..` traversal. If path doesn't exist yet
+    // (new file creation), canonicalize the parent directory instead so
+    // that `../../unrelated/file` traversal is still caught even for
+    // write-to-new-file operations.
+    match resolved.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            // Path doesn't exist; canonicalize parent and rejoin filename.
+            resolved.parent().and_then(|parent| {
+                parent.canonicalize().ok().map(|p| p.join(resolved.file_name().unwrap_or_default()))
+            }).unwrap_or(resolved)
+        }
+    }
 }
 /// Strip surrounding whitespace (e.g. a trailing newline from block-form
 /// tool args) and quotes that models occasionally emit around path args.
